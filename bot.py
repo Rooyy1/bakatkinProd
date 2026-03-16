@@ -25,9 +25,11 @@ VIDEO_FILE_ID = "BAACAgIAAxkBAAICmGm4DyUF73YuS0Y0E0JH8QeasxL6AAIVkAACN0zASa2wzY7
 # 🎥 FILE_ID эфира (после кнопки)
 EFIR_FILE_ID = "BAACAgIAAxkBAAICzGm4MnFzHcgUowhyfOCoaASmYgQRAAL4nwACFYxYSeYdAwEmqlZmOgQ"
 
-# Ссылки на КЭШАП
-KESHAP_LINK_1 = "https://s.bothelp.io/r/l1hexo.d1"
-KESHAP_LINK_2 = "https://s.bothelp.io/r/l1hk13.d1"
+# 📸 FILE_ID фото для догрева
+REMINDER_PHOTO_ID = "AgACAgIAAxkBAAIFOmm4aaW5KyZ_4xGwKC_QEHxH4rppAAIwGWsbrjjBSbH70Pp77a6iAQADAgADeQADOgQ"
+
+# Ссылка для кнопки
+CONSULTATION_LINK = "http://bakatkin-prod.ru/boost"
 
 # Ускоренная сессия для бота
 session = AiohttpSession(timeout=30)
@@ -90,14 +92,15 @@ class Database:
     
     def get_users_for_reminder(self):
         now = datetime.now()
-        one_day_ago = (now - timedelta(days=1)).strftime('%Y-%m-%d %H:%M:%S')
+        
+        time_ago = (now - timedelta(days=1)).strftime('%Y-%m-%d %H:%M:%S')
         
         self.cursor.execute('''
             SELECT user_id FROM users 
             WHERE is_active = 1 
             AND reminder_sent = 0
             AND started_at <= ?
-        ''', (one_day_ago,))
+        ''', (time_ago,))
         return [row[0] for row in self.cursor.fetchall()]
     
     def mark_reminder_sent(self, user_id):
@@ -141,10 +144,10 @@ def get_efir_keyboard():
     )
     return keyboard
 
-def get_reminder_keyboard():
+def get_consultation_keyboard():
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🔗 УЗНАТЬ БОЛЬШЕ О КЭШАП", url=KESHAP_LINK_2)]
+            [InlineKeyboardButton(text="ЗАБРАТЬ КОНСУЛЬТАЦИЮ", url=CONSULTATION_LINK)]
         ]
     )
     return keyboard
@@ -299,37 +302,25 @@ async def send_mailing_to_all(message: types.Message, reply_markup=None):
     logging.info(f"Рассылка завершена. Итого: отправлено {sent}, "
                 f"заблокировано {blocked}, ошибок {failed}")
 
-# --- Функция для отправки напоминания одному пользователю ---
+# --- НОВАЯ ФУНКЦИЯ ДЛЯ ДОГРЕВА С ФОТО ---
 async def send_reminder_to_user(user_id):
     try:
-        text = """<b>250 000 в 15 лет</b>
-именно столько заработал Глеб всего за 1 месяц
+        text = """<b>Вижу что ты заинтересован в AI индустрии, поэтому есть предложение</b>
 
-<b>Глеб</b> пришёл ко мне на <b>обучение 1,5 месяца назад КЭШАП</b>
-до этого он делал мелкие выручки за копейки и не понимал, где теряет деньги
+Сейчас бесплатно проводим <b>персональные консультации</b>, где разбираем как тебе проще всего выйти на доход с AI + бонусом дадим персональную mind карту в Miro 
 
-мы вместе разобрали ошибки, я показал, как выстраивать прогрев, дал ему команду продажников и курировал каждую неделю
+Будет супер полезно <b>для новичков</b> и для тех кто хочет <b>масштабировать текущий доход с</b> помощью AI"""
 
-<b>результат?</b>
-— 620.000₽ выручки
-— 250.000₽ чистыми за 29 дней
-
-(а если посчитать ещё не дойдущие платежи — почти 900.000₽)
-
-да, парню 15 лет
-
-если хочешь так же — жду тебя в КЭШАП
-забирай место по кнопке ниже"""
-
-        await bot.send_message(
-            user_id,
-            text,
+        await bot.send_photo(
+            chat_id=user_id,
+            photo=REMINDER_PHOTO_ID,
+            caption=text,
             parse_mode="HTML",
-            reply_markup=get_reminder_keyboard()
+            reply_markup=get_consultation_keyboard()
         )
         
         db.mark_reminder_sent(user_id)
-        logging.info(f"Догрев отправлен пользователю {user_id}")
+        logging.info(f"Новый догрев с фото отправлен пользователю {user_id}")
         return True
         
     except Exception as e:
@@ -610,7 +601,7 @@ async def main():
     print("  /stats - статистика (только число)")
     print("  /rasilka - рассылка с кнопками и подсказкой по тегам")
     print("="*60)
-    print("⏰ Догревы: автоматически через 24 часа после /start")
+    print("⏰ Догревы: через 1 минуту (ТЕСТ) / 24 часа (ПРОДАКШН)")
     print("="*60 + "\n")
     
     await dp.start_polling(bot)

@@ -545,6 +545,56 @@ async def process_second_button_url(message: types.Message, state: FSMContext):
     await send_mailing_to_all(original_message, keyboard)
     await state.clear()
 
+@dp.message(Command("getbd"))
+async def cmd_getbd(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    try:
+        cursor = db.conn.cursor()
+        
+        # Получаем всех пользователей
+        cursor.execute('''
+            SELECT user_id, username, first_name, is_active, reminder_sent, started_at 
+            FROM users 
+            ORDER BY started_at DESC
+        ''')
+        users = cursor.fetchall()
+        
+        if not users:
+            await message.answer("📭 База данных пуста")
+            return
+        
+        # Формируем сообщение
+        text = f"📊 <b>Все пользователи ({len(users)})</b>\n\n"
+        
+        for user in users:
+            user_id, username, first_name, is_active, reminder_sent, started_at = user
+            
+            # Статус
+            status = "✅" if is_active else "❌"
+            reminder = "⏰" if reminder_sent else "🕐"
+            
+            # Имя пользователя
+            name = first_name or "Без имени"
+            username_str = f" (@{username})" if username else ""
+            
+            # Дата регистрации (только дата)
+            date = started_at[:10] if started_at else "неизвестно"
+            
+            text += f"{status}{reminder} <b>{name}</b>{username_str}\n"
+            text += f"└ ID: {user_id} | {date}\n\n"
+            
+            # Telegram лимит - 4096 символов
+            if len(text) > 3500:
+                text += f"... и еще {len(users) - users.index(user) - 1} пользователей"
+                break
+        
+        await message.answer(text, parse_mode="HTML")
+        
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {e}")
+
 async def main():
     db.connect()
     

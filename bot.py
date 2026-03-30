@@ -2,7 +2,7 @@ import sqlite3
 import asyncio
 import logging
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -28,6 +28,9 @@ EFIR_FILE_ID = "BAACAgIAAxkBAAICzGm4MnFzHcgUowhyfOCoaASmYgQRAAL4nwACFYxYSeYdAwEm
 # 📸 FILE_ID фото для догрева
 REMINDER_PHOTO_ID = "AgACAgIAAxkBAAIFOmm4aaW5KyZ_4xGwKC_QEHxH4rppAAIwGWsbrjjBSbH70Pp77a6iAQADAgADeQADOgQ"
 
+# 📸 FILE_ID фото для приветствия
+WELCOME_PHOTO_ID = "AgACAgEAAxkBAAIUZ2nJeZAJQ8vCZj5aTdY66pBtTcyRAAKjC2sbRhhRRqd1IEsDmrOkAQADAgADeQADOgQ"
+
 # Ссылка для кнопки
 CONSULTATION_LINK = "http://bakatkin-prod.ru/boost"
 
@@ -50,76 +53,152 @@ class MailingStates(StatesGroup):
     waiting_for_second_button_text = State()
     waiting_for_second_button_url = State()
 
-# --- База данных SQLite ---
+# --- Состояния для опросника ---
+class SurveyStates(StatesGroup):
+    waiting_for_q1 = State()
+    waiting_for_q2 = State()
+
+# --- База данных SQLite с автоматической миграцией ---
 class Database:
     def __init__(self):
         self.conn = None
         self.cursor = None
     
     def connect(self):
-        self.conn = sqlite3.connect('bot_database.db', isolation_level=None)
-        self.conn.execute('PRAGMA journal_mode=WAL')
-        self.cursor = self.conn.cursor()
-        self.create_tables()
-        print("✅ База данных SQLite подключена")
+        try:
+            self.conn = sqlite3.connect('bot_database.db', isolation_level=None)
+            self.conn.execute('PRAGMA journal_mode=WAL')
+            self.cursor = self.conn.cursor()
+            
+            # Создаём таблицы
+            self.create_tables()
+            
+            # Добавляем новые колонки
+            self.migrate_tables()
+            
+            # Создаём индекс
+            self.cursor.execute('CREATE INDEX IF NOT EXISTS idx_reminder ON users(reminder_sent, started_at)')
+            self.conn.commit()
+            
+            print("✅ База данных SQLite подключена")
+        except Exception as e:
+            logging.error(f"Ошибка подключения к БД: {e}")
+            raise
+    
+    def migrate_tables(self):
+        try:
+            self.cursor.execute("PRAGMA table_info(users)")
+            columns = [col[1] for col in self.cursor.fetchall()]
+            
+            if 'survey_q1' not in columns:
+                self.cursor.execute('ALTER TABLE users ADD COLUMN survey_q1 TEXT')
+                print("✅ Добавлена колонка survey_q1")
+            
+            if 'survey_q2' not in columns:
+                self.cursor.execute('ALTER TABLE users ADD COLUMN survey_q2 TEXT')
+                print("✅ Добавлена колонка survey_q2")
+            
+            self.conn.commit()
+        except Exception as e:
+            logging.error(f"Ошибка миграции: {e}")
     
     def create_tables(self):
-        self.cursor.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                first_name TEXT,
-                registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                last_activity TIMESTAMP,
-                is_active INTEGER DEFAULT 1,
-                started_at TIMESTAMP,
-                reminder_sent INTEGER DEFAULT 0
-            )
-        ''')
-        self.conn.commit()
+        try:
+            self.cursor.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER PRIMARY KEY,
+                    username TEXT,
+                    first_name TEXT,
+                    registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_activity TIMESTAMP,
+                    is_active INTEGER DEFAULT 1,
+                    started_at TIMESTAMP,
+                    reminder_sent INTEGER DEFAULT 0,
+                    survey_q1 TEXT,
+                    survey_q2 TEXT
+                )
+            ''')
+            self.conn.commit()
+        except Exception as e:
+            logging.error(f"Ошибка создания таблиц: {e}")
     
     def add_user(self, user_id, username, first_name):
-        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        self.cursor.execute('''
-            INSERT OR REPLACE INTO users (user_id, username, first_name, last_activity, started_at, reminder_sent)
-            VALUES (?, ?, ?, ?, ?, COALESCE((SELECT reminder_sent FROM users WHERE user_id = ?), 0))
-        ''', (user_id, username, first_name, now, now, user_id))
-        self.conn.commit()
+        try:
+            now = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+            self.cursor.execute('''
+                INSERT INTO users (user_id, username, first_name, last_activity, started_at, reminder_sent)
+                VALUES (?, ?, ?, ?, ?, 0)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    username = EXCLUDED.username,
+                    first_name = EXCLUDED.first_name,
+                    last_activity = EXCLUDED.last_activity,
+                    started_at = COALESCE(users.started_at, EXCLUDED.started_at),
+                    reminder_sent = COALESCE(users.reminder_sent, 0)
+            ''', (user_id, username, first_name, now, now))
+            self.conn.commit()
+        except Exception as e:
+            logging.error(f"Ошибка добавления пользователя {user_id}: {e}")
+    
+    def update_survey_answers(self, user_id, q1, q2):
+        try:
+            self.cursor.execute('''
+                UPDATE users SET survey_q1 = ?, survey_q2 = ? WHERE user_id = ?
+            ''', (q1, q2, user_id))
+            self.conn.commit()
+        except Exception as e:
+            logging.error(f"Ошибка сохранения ответов пользователя {user_id}: {e}")
     
     def get_all_users(self):
-        self.cursor.execute('SELECT user_id FROM users WHERE is_active = 1')
-        return [row[0] for row in self.cursor.fetchall()]
+        try:
+            self.cursor.execute('SELECT user_id FROM users WHERE is_active = 1')
+            return [row[0] for row in self.cursor.fetchall()]
+        except Exception as e:
+            logging.error(f"Ошибка получения списка пользователей: {e}")
+            return []
     
     def get_users_for_reminder(self):
-        now = datetime.now()
-        
-        time_ago = (now - timedelta(days=1)).strftime('%Y-%m-%d %H:%M:%S')
-        
-        self.cursor.execute('''
-            SELECT user_id FROM users 
-            WHERE is_active = 1 
-            AND reminder_sent = 0
-            AND started_at <= ?
-        ''', (time_ago,))
-        return [row[0] for row in self.cursor.fetchall()]
+        try:
+            now = datetime.now(timezone.utc)
+            time_ago = (now - timedelta(days=1)).strftime('%Y-%m-%d %H:%M:%S')
+            
+            self.cursor.execute('''
+                SELECT user_id FROM users 
+                WHERE is_active = 1 
+                AND reminder_sent = 0
+                AND started_at <= ?
+            ''', (time_ago,))
+            return [row[0] for row in self.cursor.fetchall()]
+        except Exception as e:
+            logging.error(f"Ошибка получения списка для догрева: {e}")
+            return []
     
     def mark_reminder_sent(self, user_id):
-        self.cursor.execute('''
-            UPDATE users SET reminder_sent = 1 WHERE user_id = ?
-        ''', (user_id,))
-        self.conn.commit()
+        try:
+            self.cursor.execute('''
+                UPDATE users SET reminder_sent = 1 WHERE user_id = ?
+            ''', (user_id,))
+            self.conn.commit()
+        except Exception as e:
+            logging.error(f"Ошибка отметки догрева для {user_id}: {e}")
     
     def get_stats(self):
-        self.cursor.execute('SELECT COUNT(*) FROM users WHERE is_active = 1')
-        return self.cursor.fetchone()[0]
+        try:
+            self.cursor.execute('SELECT COUNT(*) FROM users WHERE is_active = 1')
+            return self.cursor.fetchone()[0]
+        except Exception as e:
+            logging.error(f"Ошибка статистики: {e}")
+            return 0
     
     def deactivate_user(self, user_id):
-        self.cursor.execute(
-            "UPDATE users SET is_active = 0 WHERE user_id = ?",
-            (user_id,)
-        )
-        self.conn.commit()
-        logging.info(f"Пользователь {user_id} деактивирован")
+        try:
+            self.cursor.execute(
+                "UPDATE users SET is_active = 0 WHERE user_id = ?",
+                (user_id,)
+            )
+            self.conn.commit()
+            logging.info(f"Пользователь {user_id} деактивирован")
+        except Exception as e:
+            logging.error(f"Ошибка деактивации {user_id}: {e}")
     
     def close(self):
         if self.conn:
@@ -127,7 +206,7 @@ class Database:
 
 db = Database()
 
-# --- Клавиатуры ---
+# --- Клавиатуры (без изменений) ---
 def get_watch_keyboard():
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -254,55 +333,58 @@ async def send_message_to_user(bot, user_id, message, reply_markup=None):
                     return f"flood_{wait_time}"
             return False
 
-# --- Функция для массовой рассылки ---
+# --- Функция для массовой рассылки (с общим try/except) ---
 async def send_mailing_to_all(message: types.Message, reply_markup=None):
-    users = db.get_all_users()
-    
-    if not users:
-        return
-    
-    logging.info(f"Начало рассылки для {len(users)} пользователей")
-    
-    batch_size = 20
-    sent = 0
-    blocked = 0
-    failed = 0
-    
-    for i in range(0, len(users), batch_size):
-        batch = users[i:i + batch_size]
-        tasks = []
+    try:
+        users = db.get_all_users()
         
-        for user_id in batch:
-            tasks.append(send_message_to_user(bot, user_id, message, reply_markup))
+        if not users:
+            return
         
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        logging.info(f"Начало рассылки для {len(users)} пользователей")
         
-        for result in results:
-            if result is True:
-                sent += 1
-            elif result == "blocked":
-                blocked += 1
-            elif isinstance(result, str) and result.startswith("flood_"):
-                try:
-                    wait_time = int(result.split("_")[1])
-                    logging.warning(f"Получен FloodWait на {wait_time} сек")
-                    await asyncio.sleep(wait_time)
-                except:
-                    await asyncio.sleep(1)
-                failed += 1
-            else:
-                failed += 1
+        batch_size = 20
+        sent = 0
+        blocked = 0
+        failed = 0
         
-        await asyncio.sleep(1.0)
+        for i in range(0, len(users), batch_size):
+            batch = users[i:i + batch_size]
+            tasks = []
+            
+            for user_id in batch:
+                tasks.append(send_message_to_user(bot, user_id, message, reply_markup))
+            
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            for result in results:
+                if result is True:
+                    sent += 1
+                elif result == "blocked":
+                    blocked += 1
+                elif isinstance(result, str) and result.startswith("flood_"):
+                    try:
+                        wait_time = int(result.split("_")[1])
+                        logging.warning(f"Получен FloodWait на {wait_time} сек")
+                        await asyncio.sleep(wait_time)
+                    except:
+                        await asyncio.sleep(1)
+                    failed += 1
+                else:
+                    failed += 1
+            
+            await asyncio.sleep(1.0)
+            
+            if (i + batch_size) % 100 == 0 or (i + batch_size) >= len(users):
+                logging.info(f"Прогресс: {min(i + batch_size, len(users))}/{len(users)}, "
+                            f"отправлено: {sent}, заблокировано: {blocked}, ошибок: {failed}")
         
-        if (i + batch_size) % 100 == 0 or (i + batch_size) >= len(users):
-            logging.info(f"Прогресс: {min(i + batch_size, len(users))}/{len(users)}, "
-                        f"отправлено: {sent}, заблокировано: {blocked}, ошибок: {failed}")
-    
-    logging.info(f"Рассылка завершена. Итого: отправлено {sent}, "
-                f"заблокировано {blocked}, ошибок {failed}")
+        logging.info(f"Рассылка завершена. Итого: отправлено {sent}, "
+                    f"заблокировано {blocked}, ошибок {failed}")
+    except Exception as e:
+        logging.error(f"Критическая ошибка в рассылке: {e}")
 
-# --- НОВАЯ ФУНКЦИЯ ДЛЯ ДОГРЕВА С ФОТО ---
+# --- Функция для отправки догрева ---
 async def send_reminder_to_user(user_id):
     try:
         text = """<b>Вижу что ты заинтересован в AI индустрии, поэтому есть предложение</b>
@@ -320,7 +402,7 @@ async def send_reminder_to_user(user_id):
         )
         
         db.mark_reminder_sent(user_id)
-        logging.info(f"Новый догрев с фото отправлен пользователю {user_id}")
+        logging.info(f"Догрев отправлен пользователю {user_id}")
         return True
         
     except Exception as e:
@@ -338,7 +420,7 @@ async def send_reminder_to_user(user_id):
             logging.error(f"Ошибка отправки догрева {user_id}: {e}")
         return False
 
-# --- Фоновая задача для проверки и отправки догревов ---
+# --- Фоновая задача для проверки и отправки догревов (с защитой) ---
 async def reminder_checker():
     while True:
         try:
@@ -348,7 +430,10 @@ async def reminder_checker():
                 logging.info(f"Найдено {len(users_for_reminder)} пользователей для догрева")
                 
                 for user_id in users_for_reminder:
-                    await send_reminder_to_user(user_id)
+                    try:
+                        await send_reminder_to_user(user_id)
+                    except Exception as e:
+                        logging.error(f"Ошибка при отправке догрева пользователю {user_id}: {e}")
                     await asyncio.sleep(0.5)
             
             await asyncio.sleep(60)
@@ -357,20 +442,88 @@ async def reminder_checker():
             logging.error(f"Ошибка в reminder_checker: {e}")
             await asyncio.sleep(60)
 
-# --- Обработчик /start ---
+# --- НОВЫЙ ОБРАБОТЧИК /start с опросником ---
 @dp.message(Command("start"))
-async def cmd_start(message: types.Message):
+async def cmd_start(message: types.Message, state: FSMContext):
     user = message.from_user
     db.add_user(user.id, user.username, user.first_name)
     
-    # 1. Сразу видео
-    await message.answer_video(video=VIDEO_FILE_ID)
+    # 1. Отправляем приветственное фото
+    welcome_text = """<b>Привет! В этом боте мы собрали более 2-х часов бесплатных гайдов, эфиров и материалов про AI + постоянное пополнение</b>
+
+Чтобы начать изучать AI бесплатно, достаточно ответить на 2 вопроса. 
+
+<blockquote>Просьба отвечать <b>честно и развернуто</b>, мы стараемся для вас!</blockquote>"""
     
-    # Ждем 2 секунды
-    await asyncio.sleep(2)
+    try:
+        await message.answer_photo(
+            photo=WELCOME_PHOTO_ID,
+            caption=welcome_text,
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logging.error(f"Ошибка отправки фото: {e}")
+        await message.answer(welcome_text, parse_mode="HTML")
     
-    # 2. Текст с кнопкой "ХОЧУ ИЗУЧАТЬ AI"
-    text1 = """<b>ПЛАН ВЫХОДА НА ПЕРВЫЕ 100-200к
+    # 2. Задаём первый вопрос
+    await asyncio.sleep(1)
+    await message.answer(
+        "<b>Вкратце о себе (имя, возраст, город, увлечения)</b>",
+        parse_mode="HTML"
+    )
+    await state.set_state(SurveyStates.waiting_for_q1)
+
+# --- Обработчик первого вопроса ---
+@dp.message(SurveyStates.waiting_for_q1)
+async def process_q1(message: types.Message, state: FSMContext):
+    await state.update_data(q1=message.text)
+    
+    await message.answer(
+        "<b>Есть ли опыт в каких либо нишах? Если есть то в каких</b>",
+        parse_mode="HTML"
+    )
+    await state.set_state(SurveyStates.waiting_for_q2)
+
+# --- Обработчик второго вопроса ---
+@dp.message(SurveyStates.waiting_for_q2)
+async def process_q2(message: types.Message, state: FSMContext):
+    user = message.from_user
+    data = await state.get_data()
+    q1 = data.get('q1')
+    q2 = message.text
+    
+    # Сохраняем ответы в базу
+    try:
+        db.update_survey_answers(user.id, q1, q2)
+    except Exception as e:
+        logging.error(f"Ошибка сохранения ответов: {e}")
+    
+    # Формируем заявку для админа
+    username = f"@{user.username}" if user.username else "не указан"
+    
+    report = (
+        f"📋 <b>НОВАЯ ЗАЯВКА</b>\n\n"
+        f"📱 Username: {username}\n\n"
+        f"<b>Вкратце о себе (имя, возраст, город, увлечения):</b>\n{q1}\n\n"
+        f"<b>Есть ли опыт в каких либо нишах? Если есть то в каких:</b>\n{q2}"
+    )
+    
+    # Отправляем заявку админу
+    try:
+        await bot.send_message(ADMIN_ID, report, parse_mode="HTML")
+    except Exception as e:
+        logging.error(f"Ошибка отправки заявки админу: {e}")
+    
+    await state.clear()
+    
+    # Отправляем основное видео
+    try:
+        await asyncio.sleep(1)
+        await message.answer_video(video=VIDEO_FILE_ID)
+        
+        await asyncio.sleep(2)
+        
+        text1 = """<b>ПЛАН ВЫХОДА НА ПЕРВЫЕ 100-200к
 в AI индустрии</b>
 
 Внутри ролика рассказал:
@@ -380,9 +533,12 @@ async def cmd_start(message: types.Message):
 • как выйти на первые деньги в индустрии с полного 0
 
 <i>Смотри теорию, фиксируй информацию и применяй на практике</i>"""
-    
-    await message.answer(text1, reply_markup=get_watch_keyboard(), parse_mode="HTML")
+        
+        await message.answer(text1, reply_markup=get_watch_keyboard(), parse_mode="HTML")
+    except Exception as e:
+        logging.error(f"Ошибка отправки видео: {e}")
 
+# --- Остальные обработчики (без изменений) ---
 @dp.callback_query(F.data == "watch")
 async def process_watch_callback(callback_query: types.CallbackQuery):
     await callback_query.answer()
@@ -399,14 +555,12 @@ async def process_watch_callback(callback_query: types.CallbackQuery):
 async def process_efir_callback(callback_query: types.CallbackQuery):
     await callback_query.answer()
     
-    # Отправляем видео с подписью
     await callback_query.message.answer_video(
         video=EFIR_FILE_ID,
         caption="<b>Эфир 1</b> — запись",
         parse_mode="HTML"
     )
 
-# --- Админ-команды ---
 @dp.message(Command("stats"))
 async def cmd_stats(message: types.Message):
     if message.from_user.id == ADMIN_ID:
@@ -436,7 +590,6 @@ async def cmd_rasilka(message: types.Message, state: FSMContext):
         await message.answer(help_text, parse_mode="HTML")
         await state.set_state(MailingStates.waiting_for_text)
 
-# --- Обработчик получения текста рассылки ---
 @dp.message(MailingStates.waiting_for_text)
 async def process_mailing_text(message: types.Message, state: FSMContext):
     await state.update_data(message=message)
@@ -446,7 +599,6 @@ async def process_mailing_text(message: types.Message, state: FSMContext):
     )
     await state.set_state(MailingStates.waiting_for_button)
 
-# --- Обработчик выбора кнопки ---
 @dp.callback_query(MailingStates.waiting_for_button)
 async def process_button_choice(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
@@ -461,14 +613,12 @@ async def process_button_choice(callback: types.CallbackQuery, state: FSMContext
         await send_mailing_to_all(original_message)
         await state.clear()
 
-# --- Обработчик текста первой кнопки ---
 @dp.message(MailingStates.waiting_for_button_text)
 async def process_button_text(message: types.Message, state: FSMContext):
     await state.update_data(button_text=message.text)
     await message.answer("Ссылка:")
     await state.set_state(MailingStates.waiting_for_button_url)
 
-# --- Обработчик ссылки первой кнопки ---
 @dp.message(MailingStates.waiting_for_button_url)
 async def process_button_url(message: types.Message, state: FSMContext):
     url = message.text
@@ -482,7 +632,6 @@ async def process_button_url(message: types.Message, state: FSMContext):
     )
     await state.set_state(MailingStates.waiting_for_second_button)
 
-# --- Обработчик выбора второй кнопки ---
 @dp.callback_query(MailingStates.waiting_for_second_button)
 async def process_second_button_choice(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
@@ -506,14 +655,12 @@ async def process_second_button_choice(callback: types.CallbackQuery, state: FSM
         await send_mailing_to_all(original_message, keyboard)
         await state.clear()
 
-# --- Обработчик текста второй кнопки ---
 @dp.message(MailingStates.waiting_for_second_button_text)
 async def process_second_button_text(message: types.Message, state: FSMContext):
     await state.update_data(second_button_text=message.text)
     await message.answer("Ссылка для второй кнопки:")
     await state.set_state(MailingStates.waiting_for_second_button_url)
 
-# --- Обработчик ссылки второй кнопки ---
 @dp.message(MailingStates.waiting_for_second_button_url)
 async def process_second_button_url(message: types.Message, state: FSMContext):
     url = message.text
@@ -544,9 +691,8 @@ async def cmd_getbd(message: types.Message):
     try:
         cursor = db.conn.cursor()
         
-        # Получаем всех пользователей
         cursor.execute('''
-            SELECT user_id, username, first_name, is_active, reminder_sent, started_at 
+            SELECT user_id, username, first_name, is_active, reminder_sent, started_at, survey_q1, survey_q2
             FROM users 
             ORDER BY started_at DESC
         ''')
@@ -556,27 +702,23 @@ async def cmd_getbd(message: types.Message):
             await message.answer("📭 База данных пуста")
             return
         
-        # Формируем сообщение
         text = f"📊 <b>Все пользователи ({len(users)})</b>\n\n"
         
         for user in users:
-            user_id, username, first_name, is_active, reminder_sent, started_at = user
+            user_id, username, first_name, is_active, reminder_sent, started_at, q1, q2 = user
             
-            # Статус
             status = "✅" if is_active else "❌"
             reminder = "⏰" if reminder_sent else "🕐"
-            
-            # Имя пользователя
             name = first_name or "Без имени"
             username_str = f" (@{username})" if username else ""
-            
-            # Дата регистрации (только дата)
             date = started_at[:10] if started_at else "неизвестно"
             
             text += f"{status}{reminder} <b>{name}</b>{username_str}\n"
-            text += f"└ ID: {user_id} | {date}\n\n"
+            text += f"└ ID: {user_id} | {date}\n"
+            if q1:
+                text += f"└ 📝 {q1[:50]}...\n"
+            text += "\n"
             
-            # Telegram лимит - 4096 символов
             if len(text) > 3500:
                 text += f"... и еще {len(users) - users.index(user) - 1} пользователей"
                 break
@@ -587,9 +729,12 @@ async def cmd_getbd(message: types.Message):
         await message.answer(f"❌ Ошибка: {e}")
 
 async def main():
-    db.connect()
+    try:
+        db.connect()
+    except Exception as e:
+        logging.error(f"Не удалось подключиться к БД: {e}")
+        return
     
-    # Запускаем фоновую задачу для проверки догревов
     asyncio.create_task(reminder_checker())
     
     print("\n" + "="*60)
@@ -600,8 +745,10 @@ async def main():
     print("📢 Команды админа:")
     print("  /stats - статистика (только число)")
     print("  /rasilka - рассылка с кнопками и подсказкой по тегам")
+    print("  /getbd - список пользователей")
     print("="*60)
-    print("⏰ Догревы: через 1 минуту (ТЕСТ) / 24 часа (ПРОДАКШН)")
+    print("⏰ Догревы: через 24 часа после /start")
+    print("📋 Опросник: 2 вопроса, заявка админу")
     print("="*60 + "\n")
     
     await dp.start_polling(bot)

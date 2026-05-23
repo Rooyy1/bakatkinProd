@@ -66,7 +66,7 @@ class Database:
     
     def connect(self):
         try:
-            self.conn = sqlite3.connect('bot_database.db', isolation_level=None)
+            self.conn = sqlite3.connect('/data/bot_database.db', isolation_level=None)
             self.conn.execute('PRAGMA journal_mode=WAL')
             self.cursor = self.conn.cursor()
             

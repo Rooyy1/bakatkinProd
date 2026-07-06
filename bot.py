@@ -19,7 +19,7 @@ load_dotenv()
 # ========================================================================
 # 📁 ПУТЬ К БАЗЕ ДАННЫХ
 # ========================================================================
-DB_PATH = 'data/bot_database.db'
+DB_PATH = '/data/bot_database.db'
 print(f"📁 Путь к базе данных: {DB_PATH}")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
